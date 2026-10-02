@@ -328,7 +328,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             CancelPacket();
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
-            LogUnhandledShort(shorts.DisabledRSSIStop, nameof(shorts.DisabledRSSIStop));
+            // DISABLED_RSSISTOP has nothing to stop: RSSI sampling ends at ADDRESS, where RSSIEND is raised at once
             LogUnhandledShort(shorts.DisabledRxEnable, nameof(shorts.DisabledRxEnable));
             LogUnhandledShort(shorts.DisabledTxEnable, nameof(shorts.DisabledTxEnable));
         }
