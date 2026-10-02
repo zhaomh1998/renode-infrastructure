@@ -7,6 +7,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -33,6 +34,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         public override void Reset()
         {
+            // The packet stages due by now happened before the reset
+            RunDuePacketStages(includeShortDisable: true);
+            CancelPacket();
             radioState = State.Disabled;
             interruptManager.Reset();
             base.Reset();
@@ -318,6 +322,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private void Disable()
         {
+            // The packet stages due by now happened before this DISABLE, so END comes before DISABLED. A due
+            // END_DISABLE stage is this DISABLE itself.
+            RunDuePacketStages(includeShortDisable: false);
+            CancelPacket();
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
             LogUnhandledShort(shorts.DisabledRSSIStop, nameof(shorts.DisabledRSSIStop));
@@ -453,8 +461,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private void ScheduleRadioEvents(uint packetLen)
         {
-            var timeSource = machine.LocalTimeSource;
-            var now = timeSource.ElapsedVirtualTime;
+            var now = machine.LocalTimeSource.ElapsedVirtualTime;
+            // Disable() and Reset() end the packet by changing the generation. An event raised here or in a stage can
+            // trigger them at once through the PPI, so the generation is checked again after it.
+            var generation = packetGeneration;
 
             // @note  Transmit times assume 1M PHY. Low level BLE firmware
             //        usually takes into account the active phy when calculating
@@ -462,24 +472,29 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             // Bit-counter
             var bcMatchTime = now + TimeInterval.FromMicroseconds(bitCountCompare.Value);
-            var bcMatchTimeStamp = new TimeStamp(bcMatchTime, timeSource.Domain);
 
             // End event
             var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * 8);
-            var endTimeStamp = new TimeStamp(endTime, timeSource.Domain);
 
             var disableTime = endTime + TimeInterval.FromMicroseconds(10);
-            var disableTimeStamp = new TimeStamp(disableTime, timeSource.Domain);
 
             // Address modelled as happening immediatley and serves as anchor
             // point for other events. RIOT triggers IRQ from it.
             SetEvent(Events.Address);
+            if(generation != packetGeneration)
+            {
+                return;
+            }
 
             // RSSI sample period is 0.25 us. Acceptable to model as happening
             // immediatley upon start
             if(shorts.AddressRSSIStart.Value)
             {
                 SetEvent(Events.RSSIEnd);
+                if(generation != packetGeneration)
+                {
+                    return;
+                }
             }
 
             // Schedule a single bit-counter compare event not eariler than
@@ -489,30 +504,70 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // support.
             if(shorts.AddressBitCountStart.Value)
             {
-                timeSource.ExecuteInSyncedState(_ =>
-                {
-                    SetEvent(Events.BitCountMatch);
-                }, bcMatchTimeStamp);
+                SchedulePacketStage(bcMatchTime, () => SetEvent(Events.BitCountMatch));
             }
 
             // Schedule "end" events all at once, simulating the transmision time
             // as 8 microseconds-per-byte. Timing distinction between events here doesn't
             // seem important
-            timeSource.ExecuteInSyncedState(_ =>
+            SchedulePacketStage(endTime, () =>
             {
                 SetEvent(Events.Payload);
+                if(generation != packetGeneration)
+                {
+                    return;
+                }
+                // CRCOK comes with END, also when END triggers a DISABLE
                 SetEvent(Events.End);
                 SetEvent(Events.CRCOk);
-            }, endTimeStamp);
+            });
 
             // BLE stacks use disabled event as common processing trigger.
-            timeSource.ExecuteInSyncedState(_ =>
+            SchedulePacketStage(disableTime, () =>
             {
                 if(shorts.EndDisable.Value)
                 {
                     Disable();
                 }
-            }, disableTimeStamp);
+            }, isShortDisable: true);
+        }
+
+        private void SchedulePacketStage(TimeInterval when, Action action, bool isShortDisable = false)
+        {
+            var stage = new PacketStage(when, action, isShortDisable);
+            packetStages.Insert(packetStages.FindLastIndex(other => other.When <= when) + 1, stage);
+            var timeSource = machine.LocalTimeSource;
+            timeSource.ExecuteInSyncedState(_ =>
+            {
+                // Run early by RunDuePacketStages, or dropped by CancelPacket, it is no longer listed
+                if(packetStages.Remove(stage))
+                {
+                    stage.Action();
+                }
+            }, new TimeStamp(when, timeSource.Domain));
+        }
+
+        // Stages run in the synced state after their due time, while a DISABLE or a reset (a CPU write, or a TIMER
+        // compare through the PPI) takes effect at its own time: the stages it overtook run first, in order.
+        private void RunDuePacketStages(bool includeShortDisable)
+        {
+            if(packetStages.Count == 0)
+            {
+                return;
+            }
+            var now = machine.LocalTimeSource.ElapsedVirtualTime;
+            PacketStage stage;
+            while((stage = packetStages.FirstOrDefault(s => s.When <= now && (includeShortDisable || !s.IsShortDisable))) != null)
+            {
+                packetStages.Remove(stage);
+                stage.Action();
+            }
+        }
+
+        private void CancelPacket()
+        {
+            packetGeneration++;
+            packetStages.Clear();
         }
 
         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
@@ -534,6 +589,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
 
         private State radioState;
+        private ulong packetGeneration;
         private byte[] addressPrefixes;
         private Shorts shorts;
         private IFlagRegisterField crcIncludedInLength;
@@ -567,6 +623,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private readonly InterruptManager<Events> interruptManager;
 
         private readonly ConcurrentQueue<KeyValuePair<byte[], IRadio>> rxBuffer;
+        // the stages of the packet in flight that are still to come, by due time
+        private readonly List<PacketStage> packetStages = new List<PacketStage>();
 
         private readonly Dictionary<uint, int> bluetoothLEChannelMap = new Dictionary<uint, int>()
         {
@@ -635,6 +693,22 @@ namespace Antmicro.Renode.Peripherals.Wireless
             public IFlagRegisterField RxReadyStart;
             public IFlagRegisterField PHYEndDisable;
             public IFlagRegisterField PHYEndStart;
+        }
+
+        private class PacketStage
+        {
+            public PacketStage(TimeInterval when, Action action, bool isShortDisable)
+            {
+                When = when;
+                Action = action;
+                IsShortDisable = isShortDisable;
+            }
+
+            public TimeInterval When { get; }
+
+            public Action Action { get; }
+
+            public bool IsShortDisable { get; }
         }
 
         private enum CRCAddressHandling
