@@ -517,9 +517,12 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 {
                     return;
                 }
-                // CRCOK comes with END, also when END triggers a DISABLE
-                SetEvent(Events.End);
-                SetEvent(Events.CRCOk);
+                // END and CRCOK reach the PPI together, before anything END triggers
+                RaiseTogether(() =>
+                {
+                    SetEvent(Events.End);
+                    SetEvent(Events.CRCOk);
+                });
             });
 
             // BLE stacks use disabled event as common processing trigger.
@@ -570,6 +573,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
             packetStages.Clear();
         }
 
+        private void RaiseTogether(Action raise)
+        {
+            if(ppi == null)
+            {
+                ppi = machine.GetPeripheralsOfType<NRF52840_PPI>().FirstOrDefault();
+            }
+            if(ppi == null)
+            {
+                raise();
+                return;
+            }
+            ppi.RaiseTogether(raise);
+        }
+
         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
         {
             // based on 6.20.2 Address configuration
@@ -590,6 +607,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private State radioState;
         private ulong packetGeneration;
+        private NRF52840_PPI ppi;
         private byte[] addressPrefixes;
         private Shorts shorts;
         private IFlagRegisterField crcIncludedInLength;

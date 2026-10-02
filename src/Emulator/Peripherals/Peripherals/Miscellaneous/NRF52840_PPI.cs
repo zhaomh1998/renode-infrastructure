@@ -7,10 +7,13 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
+using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
+using Antmicro.Renode.Peripherals.Timers;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
@@ -18,11 +21,6 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
     {
         public NRF52840_PPI(IMachine machine) : base(machine)
         {
-            for(var i = 0; i < Channels; i++)
-            {
-                var j = i;
-                eventCallbacks[i] = offset => EventReceived(j, offset);
-            }
             DefineRegisters();
             Reset();
         }
@@ -42,12 +40,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             for(var i = 0; i < Channels; i++)
             {
                 forkEndpoint[i] = 0;
+                eventProviders[i] = null;
             }
-            foreach(var sender in registeredEventSenders)
+            foreach(var callback in eventCallbacks)
             {
-                sender.Provider.EventTriggered -= eventCallbacks[sender.Channel];
+                callback.Key.EventTriggered -= callback.Value;
             }
-            registeredEventSenders.Clear();
+            eventCallbacks.Clear();
             initialized = false;
         }
 
@@ -62,6 +61,31 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         public long Size => 0x1000;
+
+        /// <summary>
+        /// Raises events that happen at the same time: those that `raise` triggers reach the channels together, in one
+        /// round, once it returns.
+        /// </summary>
+        public void RaiseTogether(Action raise)
+        {
+            if(dispatchingEvents)
+            {
+                // they join the next round of the dispatch under way
+                raise();
+                return;
+            }
+            dispatchingEvents = true;
+            try
+            {
+                raise();
+                DispatchRaisedEvents();
+            }
+            finally
+            {
+                raisedEvents.Clear();
+                dispatchingEvents = false;
+            }
+        }
 
         private void DefineRegisters()
         {
@@ -194,20 +218,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void UpdateEventEndpoint(uint oldValue, uint newValue, int eventId)
         {
-            if(oldValue != 0)
+            var oldProvider = eventProviders[eventId];
+            if(oldProvider != null)
             {
-                var target = sysbus.WhatPeripheralIsAt(oldValue);
-                if(target is INRFEventProvider nrfTarget)
+                eventProviders[eventId] = null;
+                if(Array.IndexOf(eventProviders, oldProvider) == -1)
                 {
-                    //todo: how to do it on reset?
-                    nrfTarget.EventTriggered -= eventCallbacks[eventId];
-                    registeredEventSenders.Remove(EventEntry.Create(nrfTarget, eventId));
-                    this.Log(LogLevel.Debug, "Disconnected channel {1} from event 0x{0:X}", oldValue, eventId);
+                    oldProvider.EventTriggered -= eventCallbacks[oldProvider];
+                    eventCallbacks.Remove(oldProvider);
                 }
-                else
-                {
-                    this.Log(LogLevel.Error, "Failed to unregister PPI from 0x{0:X} for channel {1}", oldValue, eventId);
-                }
+                this.Log(LogLevel.Debug, "Disconnected channel {1} from event 0x{0:X}", oldValue, eventId);
             }
             eventEndpoint[eventId] = newValue;
             if(newValue != 0)
@@ -215,8 +235,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 var target = sysbus.WhatPeripheralIsAt(newValue);
                 if(target is INRFEventProvider nrfTarget)
                 {
-                    nrfTarget.EventTriggered += eventCallbacks[eventId];
-                    registeredEventSenders.Add(EventEntry.Create(nrfTarget, eventId));
+                    if(!eventCallbacks.ContainsKey(nrfTarget))
+                    {
+                        eventCallbacks[nrfTarget] = offset => EventReceived(nrfTarget, offset);
+                        nrfTarget.EventTriggered += eventCallbacks[nrfTarget];
+                    }
+                    eventProviders[eventId] = nrfTarget;
                     this.Log(LogLevel.Debug, "Connected channel {1} to event 0x{0:X}", newValue, eventId);
                 }
                 else
@@ -226,50 +250,149 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
         }
 
-        private void EventReceived(int id, uint offset)
+        // Tasks run at once, as on hardware. Deferred to the next synced state, a task whose event came before a CPU
+        // write in the same quantum would run after that write.
+        private void EventReceived(INRFEventProvider provider, uint offset)
         {
-            if((eventEndpoint[id] & EventOffsetMask) != offset)
+            raisedEvents.Add((provider, offset));
+            if(dispatchingEvents)
             {
-                // this happens when we are registered for an event in the peripheral, but we receive a different one
+                // A task of the round under way raised it (on hardware it comes a clock later, after all of that
+                // round's tasks), or RaiseTogether's caller did.
                 return;
             }
-            if(!channelEnabled[id].Value)
+            dispatchingEvents = true;
+            try
             {
-                var foundGroup = false;
-                // if the channel is disabled, it may be enabled by a group
-                for(var i = 0; i < ChannelGroups; i++)
+                DispatchRaisedEvents();
+            }
+            finally
+            {
+                raisedEvents.Clear();
+                dispatchingEvents = false;
+            }
+        }
+
+        // Each round triggers the channels on the events raised in the round before. A cascade without a loop passes
+        // each channel at most once, so it ends within Channels rounds; a longer one is channels triggering each other
+        // in a loop, which on hardware would take time.
+        private void DispatchRaisedEvents()
+        {
+            for(var round = 0; raisedEvents.Count > 0; round++)
+            {
+                var events = raisedEvents;
+                raisedEvents = new List<(INRFEventProvider, uint)>();
+                var triggeredChannels = new List<int>();
+                var tasks = CollectTasks(events, triggeredChannels);
+                if(round == Channels && tasks.Count > 0)
                 {
-                    if(channelGroupEnabled[i] && channelGroups[i][id].Value)
+                    throw new RecoverableException($"PPI channels {string.Join(", ", triggeredChannels)} keep triggering each other at one instant: a loop that would take time on hardware");
+                }
+                foreach(var task in tasks)
+                {
+                    sysbus.WriteDoubleWord(task, 1);
+                }
+            }
+        }
+
+        // Hardware triggers all channels on simultaneous events together, so which of them fire is decided before any
+        // task runs, and a task triggered more than once runs once.
+        private List<uint> CollectTasks(List<(INRFEventProvider, uint)> events, List<int> triggeredChannels)
+        {
+            var tasks = new List<uint>();
+            for(var id = 0; id < Channels; id++)
+            {
+                if(!IsRaised(events, id) || !IsChannelEnabled(id))
+                {
+                    continue;
+                }
+                triggeredChannels.Add(id);
+                if(taskEndpoint[id] != 0)
+                {
+                    this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering task at 0x{2:X}", id, eventEndpoint[id], taskEndpoint[id]);
+                    if(!tasks.Contains(taskEndpoint[id]))
                     {
-                        foundGroup = true;
-                        break;
+                        tasks.Add(taskEndpoint[id]);
                     }
                 }
-                if(!foundGroup)
+                else
                 {
-                    this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}, but it's disabled.", id, eventEndpoint[id]);
-                    return;
+                    this.Log(LogLevel.Warning, "Received an event on channel {0} from 0x{1:X}, but there is no task configured", id, eventEndpoint[id]);
+                }
+                if(forkEndpoint[id] != 0)
+                {
+                    this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering fork task at 0x{2:X}", id, eventEndpoint[id], forkEndpoint[id]);
+                    if(!tasks.Contains(forkEndpoint[id]))
+                    {
+                        tasks.Add(forkEndpoint[id]);
+                    }
                 }
             }
-            if(taskEndpoint[id] != 0)
+            if(tasks.Count > 1)
             {
-                this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering task at 0x{2:X}", id, eventEndpoint[id], taskEndpoint[id]);
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(taskEndpoint[id], 1));
+                // Of simultaneous tasks the specification ranks, only the winner runs: a channel group's EN over its
+                // DIS, a TIMER's STOP over its START.
+                var losers = tasks.Where(task => TryGetWinningTask(task, out var winner) && tasks.Contains(winner)).ToList();
+                tasks.RemoveAll(losers.Contains);
             }
-            else
+            return tasks;
+        }
+
+        private bool IsRaised(List<(INRFEventProvider Provider, uint Offset)> events, int id)
+        {
+            foreach(var raised in events)
             {
-                this.Log(LogLevel.Warning, "Received an event on channel {0} from 0x{1:X}, but there is no task configured", id, eventEndpoint[id]);
+                if(raised.Provider == eventProviders[id] && raised.Offset == (eventEndpoint[id] & RegisterOffsetMask))
+                {
+                    return true;
+                }
             }
-            if(forkEndpoint[id] != 0)
+            return false;
+        }
+
+        private bool IsChannelEnabled(int id)
+        {
+            if(channelEnabled[id].Value)
             {
-                this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}. Triggering fork task at 0x{2:X}", id, eventEndpoint[id], forkEndpoint[id]);
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ => sysbus.WriteDoubleWord(forkEndpoint[id], 1));
+                return true;
             }
+            // if the channel is disabled, it may be enabled by a group
+            for(var i = 0; i < ChannelGroups; i++)
+            {
+                if(channelGroupEnabled[i] && channelGroups[i][id].Value)
+                {
+                    return true;
+                }
+            }
+            this.Log(LogLevel.Noisy, "Received an event on channel {0} from 0x{1:X}, but it's disabled.", id, eventEndpoint[id]);
+            return false;
+        }
+
+        private bool TryGetWinningTask(uint task, out uint winner)
+        {
+            var offset = task & RegisterOffsetMask;
+            var target = sysbus.WhatPeripheralIsAt(task);
+            if(target == this && offset <= (uint)Registers.ChannelGroup5Disable && offset % 8 == 4)
+            {
+                // TASKS_CHG[n].DIS, whose TASKS_CHG[n].EN is just before it
+                winner = task - 4;
+                return true;
+            }
+            if(target is NRF52840_Timer && offset == TimerStartTask)
+            {
+                winner = task - TimerStartTask + TimerStopTask;
+                return true;
+            }
+            winner = 0;
+            return false;
         }
 
         private IFlagRegisterField[] channelEnabled = new IFlagRegisterField[Channels];
 
         private bool initialized; // should not be reset - used for delayed configuration after the machine is created
+        private bool dispatchingEvents;
+        // events raised for the next round of EventReceived
+        private List<(INRFEventProvider, uint)> raisedEvents = new List<(INRFEventProvider, uint)>();
         private readonly uint[] eventEndpoint = new uint[Channels];
         private readonly uint[] taskEndpoint = new uint[Channels];
         private readonly uint[] forkEndpoint = new uint[Channels];
@@ -277,25 +400,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private readonly IFlagRegisterField[][] channelGroups = new IFlagRegisterField[ChannelGroups][];
 
-        private readonly HashSet<EventEntry> registeredEventSenders = new HashSet<EventEntry>();
+        private readonly INRFEventProvider[] eventProviders = new INRFEventProvider[Channels];
 
-        private readonly Action<uint>[] eventCallbacks = new Action<uint>[Channels]; //todo reset
+        private readonly Dictionary<INRFEventProvider, Action<uint>> eventCallbacks = new Dictionary<INRFEventProvider, Action<uint>>();
 
-        private const int EventOffsetMask = 0xFFF;
+        private const int RegisterOffsetMask = 0xFFF;
         private const int ChannelGroups = 6;
         private const int ConfigurableChannels = 20;
         private const int Channels = 32;
-
-        private struct EventEntry
-        {
-            public static EventEntry Create(INRFEventProvider provider, int channel)
-            {
-                return new EventEntry { Provider = provider, Channel = channel };
-            }
-
-            public INRFEventProvider Provider;
-            public int Channel;
-        }
+        private const uint TimerStartTask = 0x000;
+        private const uint TimerStopTask = 0x004;
 
         private enum Registers
         {

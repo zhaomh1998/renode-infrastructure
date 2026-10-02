@@ -35,6 +35,12 @@ namespace Antmicro.Renode.Peripherals.Timers
                 innerTimers[j].CompareReached += () =>
                 {
                     this.Log(LogLevel.Noisy, "Compare Reached on CC{0} is {1}", j, innerTimers[j].Compare);
+                    if(!timerRunning)
+                    {
+                        // ComparingTimer re-arms the comparator before this handler, also when a compare at the same
+                        // time stopped the timer (e.g. COMPARE[0] -> PPI -> STOP with CC[0] == CC[j])
+                        innerTimers[j].Enabled = false;
+                    }
                     eventCompareEnabled[j].Value = true;
                     EventTriggered?.Invoke((uint)Register.Compare0EventPending + 0x4u * j);
                     UpdateInterrupts();
