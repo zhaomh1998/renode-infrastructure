@@ -28,6 +28,7 @@ namespace Antmicro.Renode.Time
         {
             Ready = new LinkedList<TimeHandle>();
             NotReady = new LinkedList<TimeHandle>();
+            registrationIndex = new Dictionary<TimeHandle, ulong>();
             locker = new object();
         }
 
@@ -80,6 +81,7 @@ namespace Antmicro.Renode.Time
         {
             lock(locker)
             {
+                registrationIndex[handle] = nextRegistrationIndex++;
                 var readyForGrant = handle.IsReadyForNewTimeGrant;
                 (readyForGrant ? Ready : NotReady).AddLast(handle);
                 handle.IsDone = readyForGrant;
@@ -99,16 +101,18 @@ namespace Antmicro.Renode.Time
 
             lock(locker)
             {
+                // Both queues keep registration order, so a handle that blocked once does not move behind
+                // the others: under serial execution this order is the order in which sinks run each quantum.
                 if(isOnReadyList)
                 {
                     Ready.Remove(handle);
-                    NotReady.AddLast(handle);
+                    InsertInRegistrationOrder(NotReady, handle);
                     handle.Value.IsDone = false;
                 }
                 else
                 {
                     NotReady.Remove(handle);
-                    Ready.AddLast(handle);
+                    InsertInRegistrationOrder(Ready, handle);
                     handle.Value.IsDone = true;
                 }
             }
@@ -179,8 +183,27 @@ namespace Antmicro.Renode.Time
                         Monitor.Enter(locker, ref wasLocked);
                     }
                     list.Remove(node);
+                    registrationIndex.Remove(node.Value);
                     node.Value.Unlatch();
                 }
+            }
+        }
+
+        private void InsertInRegistrationOrder(LinkedList<TimeHandle> list, LinkedListNode<TimeHandle> handle)
+        {
+            var index = registrationIndex[handle.Value];
+            var next = list.First;
+            while(next != null && registrationIndex[next.Value] < index)
+            {
+                next = next.Next;
+            }
+            if(next == null)
+            {
+                list.AddLast(handle);
+            }
+            else
+            {
+                list.AddBefore(next, handle);
             }
         }
 
@@ -207,6 +230,9 @@ namespace Antmicro.Renode.Time
             return (minTicks, count);
         }
 
+        private ulong nextRegistrationIndex;
+
+        private readonly Dictionary<TimeHandle, ulong> registrationIndex;
         private readonly object locker;
     }
 }

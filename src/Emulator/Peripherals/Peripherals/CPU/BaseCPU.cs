@@ -76,6 +76,14 @@ namespace Antmicro.Renode.Peripherals.CPU
             // by default do nothing
         }
 
+        /// <summary>
+        /// Returns once the CPU thread started last has activated its time handle, or has ended.
+        /// </summary>
+        public void WaitUntilThreadStarted()
+        {
+            cpuThreadStarted.Wait();
+        }
+
         public ulong Step(int count = 1)
         {
             if(isAborted)
@@ -590,6 +598,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                 using(var activityTracker = (DisposableWrapper)this.ObtainSinkActiveState())
                 using(TimeDomainsManager.Instance.RegisterCurrentThread(() => new TimeStamp(TimeHandle.TotalElapsedTime, TimeHandle.TimeSource.Domain)))
                 {
+                    cpuThreadStarted.Set();
                     try
                     {
                     restart:
@@ -712,6 +721,9 @@ namespace Antmicro.Renode.Peripherals.CPU
             }
             finally
             {
+                // For WaitUntilThreadStarted a thread that ends before its loop has started too. Set while cpuThread
+                // still holds this thread, so it cannot end the wait for a thread started after it.
+                cpuThreadStarted.Set();
                 cpuThread = null;
                 if(isLocked)
                 {
@@ -1011,6 +1023,7 @@ namespace Antmicro.Renode.Peripherals.CPU
                         IsBackground = true,
                         Name = this.GetCPUThreadName(machine)
                     };
+                    cpuThreadStarted.Reset();
                     cpuThread.Start();
                 }
                 else
@@ -1039,6 +1052,9 @@ namespace Antmicro.Renode.Peripherals.CPU
         private readonly SealableValue<uint> performanceInMips = new SealableValue<uint>();
 
         private readonly object cpuThreadBodyLock = new object();
+
+        [Constructor(true)]
+        private readonly ManualResetEventSlim cpuThreadStarted = new ManualResetEventSlim(true);
 
         protected class RegisterAttribute : Attribute
         {

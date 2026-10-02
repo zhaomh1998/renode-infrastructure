@@ -776,9 +776,16 @@ namespace Antmicro.Renode.Core
             //hits the pause button.
             //Otherwise it would crash.
             ExternalsManager.Start();
-            foreach(var machine in Machines.ToList())
+            var machines = Machines.ToList();
+            foreach(var machine in machines)
             {
                 machine.Start();
+            }
+            // A time source granting before a CPU thread just started is in its loop takes that CPU as blocked, and
+            // under serial execution runs it after the others. Wait for the threads, holding no CPU or time handle lock.
+            foreach(var cpu in machines.SelectMany(x => x.SystemBus.GetCPUs()).OfType<BaseCPU>())
+            {
+                cpu.WaitUntilThreadStarted();
             }
         }
 
