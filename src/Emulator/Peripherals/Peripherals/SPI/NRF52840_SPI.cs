@@ -66,6 +66,7 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             if(easyDMA)
             {
+                status |= stoppedPending.Value && stoppedEnabled.Value;
                 status |= startedPending.Value && startedEnabled.Value;
                 status |= endPending.Value && endEnabled.Value;
                 status |= endRxPending.Value && endRxEnabled.Value;
@@ -93,7 +94,7 @@ namespace Antmicro.Renode.Peripherals.SPI
             {
                 Registers.EnableInterrupt.Define(this)
                     .WithReservedBits(0, 1)
-                    .WithTaggedFlag("STOPPED", 1)
+                    .WithFlag(1, out stoppedEnabled, FieldMode.Read | FieldMode.Set, name: "STOPPED")
                     .WithReservedBits(2, 2)
                     .WithFlag(4, out endRxEnabled, FieldMode.Read | FieldMode.Set, name: "ENDRX")
                     .WithReservedBits(5, 1)
@@ -108,7 +109,9 @@ namespace Antmicro.Renode.Peripherals.SPI
 
                 Registers.DisableInterrupt.Define(this)
                     .WithReservedBits(0, 1)
-                    .WithTaggedFlag("STOPPED", 1)
+                    .WithFlag(1, name: "STOPPED",
+                        valueProviderCallback: _ => stoppedEnabled.Value,
+                        writeCallback: (_, val) => { if(val) stoppedEnabled.Value = false; })
                     .WithReservedBits(2, 2)
                     .WithFlag(4, name: "ENDRX",
                         valueProviderCallback: _ => endRxEnabled.Value,
@@ -248,6 +251,27 @@ namespace Antmicro.Renode.Peripherals.SPI
                         }
                     })
                     .WithReservedBits(1, 31)
+                ;
+
+                // The SPIM answers STOP with STOPPED also when it is already stopped, e.g. after END: drivers wait
+                // for that event before writing ENABLE. A transaction still queued for the synced state is not cut short.
+                Registers.TasksStop.Define(this)
+                    .WithFlag(0, FieldMode.Write, name: "TASKS_STOP", writeCallback: (_, val) =>
+                    {
+                        if(val)
+                        {
+                            stoppedPending.Value = true;
+                            EventTriggered?.Invoke((uint)Registers.EventsStopped);
+                            UpdateInterrupts();
+                        }
+                    })
+                    .WithReservedBits(1, 31)
+                ;
+
+                Registers.EventsStopped.Define(this)
+                    .WithFlag(0, out stoppedPending, name: "EVENTS_STOPPED")
+                    .WithReservedBits(1, 31)
+                    .WithWriteCallback((_, __) => UpdateInterrupts())
                 ;
 
                 Registers.EventsStarted.Define(this)
@@ -419,7 +443,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private IFlagRegisterField startedEnabled;
 
         private IFlagRegisterField startedPending;
+        private IFlagRegisterField stoppedEnabled;
 
+        private IFlagRegisterField stoppedPending;
         private IFlagRegisterField endRxEnabled;
         private readonly IBusController sysbus;
 
@@ -433,6 +459,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         private enum Registers
         {
             TasksStart = 0x10,
+            TasksStop = 0x14,
+            EventsStopped = 0x104,
             EventsReady = 0x108,
             EventsEndRx = 0x110,
             EventsEnd = 0x118,
