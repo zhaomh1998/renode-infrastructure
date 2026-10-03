@@ -40,6 +40,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             selectedSlave = null;
             enabled = false;
             transmissionInProgress = false;
+            addressOnlyWrite = false;
 
             RegistersCollection.Reset();
             UpdateInterrupts();
@@ -74,10 +75,16 @@ namespace Antmicro.Renode.Peripherals.I2C
                     }
 
                     transmissionInProgress = true;
+                    addressOnlyWrite = false;
                     // send what is buffered as this might be a repeated start condition
                     TrySendDataToSlave();
                     // prepare to receive data from slave
                     slaveToMasterBuffer.Clear();
+                    if(enabled && !TryGetByAddress((int)address.Value, out selectedSlave))
+                    {
+                        SetAddressNack();
+                        return;
+                    }
                     // try read the response
                     TryFillReceivedBuffer(true);
                 })
@@ -93,6 +100,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                     }
 
                     transmissionInProgress = true;
+                    addressOnlyWrite = true;
                     // send what is buffered as this might be a repeated start condition
                     TrySendDataToSlave();
                     // prepare to receive data from slave
@@ -159,7 +167,7 @@ namespace Antmicro.Renode.Peripherals.I2C
 
             Registers.ErrorSource.Define(this)
                 .WithTaggedFlag("OVERRUN", 0)
-                .WithFlag(1, out addressNackError, name: "ANACK")
+                .WithFlag(1, out addressNackError, FieldMode.Read | FieldMode.WriteOneToClear, name: "ANACK")
                 .WithTaggedFlag("DNACK", 2)
                 .WithReservedBits(3, 29)
             ;
@@ -253,13 +261,10 @@ namespace Antmicro.Renode.Peripherals.I2C
             Registers.TransferBuffer.Define(this)
                 .WithValueField(0, 8, writeCallback: (_, val) =>
                 {
+                    addressOnlyWrite = false;
                     if(selectedSlave == null)
                     {
-                        this.Log(LogLevel.Warning, "No slave is currently attached at selected address 0x{0:X}", address.Value);
-                        addressNackError.Value = true;
-                        errorInterruptPending.Value = true;
-                        EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
-                        UpdateInterrupts();
+                        SetAddressNack();
                         return;
                     }
 
@@ -361,7 +366,19 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private void StopTransmission()
         {
+            // The error handler can issue STOP again after an address-only probe has already stopped.
+            if(addressOnlyWrite && !transmissionInProgress)
+            {
+                return;
+            }
+
             transmissionInProgress = false;
+
+            // TWI has no transfer length register, so an address-only write is known only at STOP.
+            if(addressOnlyWrite && enabled && !TryGetByAddress((int)address.Value, out selectedSlave))
+            {
+                SetAddressNack();
+            }
 
             // send out buffered data to slave;
             // in reality there is no fifo - each
@@ -374,6 +391,15 @@ namespace Antmicro.Renode.Peripherals.I2C
 
             stoppedInterruptPending.Value = true;
             EventTriggered?.Invoke((uint)Registers.StoppedInterruptPending);
+            UpdateInterrupts();
+        }
+
+        private void SetAddressNack()
+        {
+            this.Log(LogLevel.Warning, "No slave is currently attached at selected address 0x{0:X}", address.Value);
+            addressNackError.Value = true;
+            errorInterruptPending.Value = true;
+            EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
             UpdateInterrupts();
         }
 
@@ -393,6 +419,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private II2CPeripheral selectedSlave;
         private bool enabled;
         private bool transmissionInProgress;
+        private bool addressOnlyWrite;
 
         private IValueRegisterField address;
         private IFlagRegisterField txInterruptPending;
