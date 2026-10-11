@@ -172,20 +172,16 @@ namespace Antmicro.Renode.Peripherals.Timers
                 .WithReservedBits(0, 16)
                 .WithFlags(16, numberOfEvents, out eventCompareInterruptEnabled, FieldMode.Set | FieldMode.Read, name: "COMPARE")
                 .WithReservedBits(22 - MaxNumberOfEvents + numberOfEvents, 10 + MaxNumberOfEvents - numberOfEvents)
-                .WithChangeCallback((_, __) =>
-                {
-                    UpdateInterrupts();
-                })
+                .WithWriteCallback((_, __) => UpdateInterrupts())
             ;
 
             Register.InterruptEnableClear.Define(this)
                 .WithReservedBits(0, 16)
-                .WithFlags(16, numberOfEvents, name: "COMPARE", writeCallback: (i, _, value) => { if(value) eventCompareInterruptEnabled[i].Value = false; })
+                .WithFlags(16, numberOfEvents, name: "COMPARE",
+                    writeCallback: (i, _, value) => { if(value) eventCompareInterruptEnabled[i].Value = false; },
+                    valueProviderCallback: (i, _) => eventCompareInterruptEnabled[i].Value)
                 .WithReservedBits(22 - MaxNumberOfEvents + numberOfEvents, 10 + MaxNumberOfEvents - numberOfEvents)
-                .WithChangeCallback((_, __) =>
-                {
-                    UpdateInterrupts();
-                })
+                .WithWriteCallback((_, __) => UpdateInterrupts())
             ;
 
             Register.Mode.Define(this)
