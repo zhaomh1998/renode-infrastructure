@@ -168,7 +168,7 @@ namespace Antmicro.Renode.Peripherals.I2C
             Registers.ErrorSource.Define(this)
                 .WithTaggedFlag("OVERRUN", 0)
                 .WithFlag(1, out addressNackError, FieldMode.Read | FieldMode.WriteOneToClear, name: "ANACK")
-                .WithTaggedFlag("DNACK", 2)
+                .WithFlag(2, out dataNackError, FieldMode.Read | FieldMode.WriteOneToClear, name: "DNACK")
                 .WithReservedBits(3, 29)
             ;
 
@@ -366,8 +366,8 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private void StopTransmission()
         {
-            // The error handler can issue STOP again after an address-only probe has already stopped.
-            if(addressOnlyWrite && !transmissionInProgress)
+            // The error handler issues STOP again when the error and STOPPED arrive together.
+            if(!transmissionInProgress)
             {
                 return;
             }
@@ -375,9 +375,17 @@ namespace Antmicro.Renode.Peripherals.I2C
             transmissionInProgress = false;
 
             // TWI has no transfer length register, so an address-only write is known only at STOP.
-            if(addressOnlyWrite && enabled && !TryGetByAddress((int)address.Value, out selectedSlave))
+            // An empty write lets a present slave refuse its address.
+            if(addressOnlyWrite && enabled)
             {
-                SetAddressNack();
+                if(TryGetByAddress((int)address.Value, out selectedSlave))
+                {
+                    selectedSlave.Write(new byte[0]);
+                }
+                else
+                {
+                    SetAddressNack();
+                }
             }
 
             // send out buffered data to slave;
@@ -437,6 +445,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private IFlagRegisterField byteBoundaryStopShortcut;
 
         private IFlagRegisterField addressNackError;
+        private IFlagRegisterField dataNackError;
 
         private readonly Queue<byte> slaveToMasterBuffer;
         private readonly Queue<byte> masterToSlaveBuffer;
